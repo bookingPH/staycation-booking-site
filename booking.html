@@ -554,7 +554,8 @@
         });
         renderAddons();
 
-        // Start real-time calendar listener
+        // Set up calendar (delegation events once, then start listener)
+        setupCalendarEvents();
         startCalendarListener();
         renderCalendar();
 
@@ -568,18 +569,17 @@
     function startCalendarListener() {
       if (unsubCalendar) unsubCalendar();
 
-      const bookingsQuery = query(
-        collection(clientRef, 'bookings'),
+      // Read from availability (public, no personal info) instead of bookings (admin-only)
+      const availQuery = query(
+        collection(clientRef, 'availability'),
         where('unitId', '==', unitId),
         where('status', 'in', ['pending_review', 'confirmed'])
       );
 
-      const blockedQuery = collection(clientRef, 'blocked_dates');
-
       let bookingDates = new Set();
       let manualDates = new Set();
 
-      unsubCalendar = onSnapshot(bookingsQuery, snap => {
+      unsubCalendar = onSnapshot(availQuery, snap => {
         bookingDates = new Set();
         snap.forEach(d => {
           const { checkIn, checkOut } = d.data();
@@ -592,9 +592,11 @@
           }
         });
         rebuildBlocked(bookingDates, manualDates);
+      }, err => {
+        console.warn('Calendar listener error (non-fatal):', err.message);
       });
 
-      getDocs(blockedQuery).then(snap => {
+      getDocs(collection(clientRef, 'blocked_dates')).then(snap => {
         manualDates = new Set();
         snap.forEach(d => {
           const { unitId: bUnitId, startDate, endDate } = d.data();
@@ -642,6 +644,7 @@
     }
 
     // ── CALENDAR RENDER ───────────────────────────────
+    // Event delegation is set up once in loadData(). renderCalendar() only updates HTML + range classes.
     function renderCalendar() {
       const grid = el('calendar-grid');
       el('cal-month-label').textContent = `${MONTH_NAMES[calMonth]} ${calYear}`;
@@ -657,63 +660,91 @@
       for (let d = 1; d <= daysInMonth; d++) {
         const dateStr = `${calYear}-${pad(calMonth+1)}-${pad(d)}`;
         let cls = 'cal-day';
-        let title = '';
 
-        if (dateStr < today) {
-          cls += ' past';
-        } else if (blockedSet.has(dateStr)) {
-          cls += ' blocked'; title = 'Unavailable';
-        } else {
-          cls += ' available';
-        }
+        if (dateStr < today) cls += ' past';
+        else if (blockedSet.has(dateStr)) cls += ' blocked';
+        else cls += ' available';
 
         if (dateStr === today) cls += ' today';
 
-        if (S.checkIn && S.checkOut) {
-          if (dateStr === S.checkIn) cls += ' range-start';
-          else if (dateStr === S.checkOut) cls += ' range-end';
-          else if (dateStr > S.checkIn && dateStr < S.checkOut) cls += ' in-range';
-        } else if (S.checkIn && !S.checkOut) {
-          if (dateStr === S.checkIn) cls += ' range-start range-end';
-          else if (hoverDate && dateStr > S.checkIn && dateStr <= hoverDate) cls += ' in-range';
-          else if (hoverDate && dateStr === hoverDate) cls += ' range-end';
-        }
-
-        html += `<div class="${cls}" data-date="${dateStr}" title="${title}">${d}</div>`;
+        html += `<div class="${cls}" data-date="${dateStr}">${d}</div>`;
       }
 
       grid.innerHTML = html;
+      updateRangeDisplay();
+    }
 
-      // Events
-      grid.querySelectorAll('.cal-day.available').forEach(cell => {
-        cell.addEventListener('click', onDateClick);
-        cell.addEventListener('mouseenter', () => {
-          if (S.checkIn && !S.checkOut) { hoverDate = cell.dataset.date; renderCalendar(); }
-        });
-        cell.addEventListener('mouseleave', () => {
-          if (S.checkIn && !S.checkOut) { hoverDate = null; renderCalendar(); }
-        });
+    // Update range highlight classes without touching the DOM structure
+    function updateRangeDisplay() {
+      const grid = el('calendar-grid');
+      grid.querySelectorAll('.cal-day[data-date]').forEach(cell => {
+        const d = cell.dataset.date;
+        cell.classList.remove('range-start', 'range-end', 'in-range');
+
+        if (S.checkIn && S.checkOut) {
+          if (d === S.checkIn) cell.classList.add('range-start');
+          else if (d === S.checkOut) cell.classList.add('range-end');
+          else if (d > S.checkIn && d < S.checkOut) cell.classList.add('in-range');
+        } else if (S.checkIn && !S.checkOut) {
+          if (d === S.checkIn) {
+            cell.classList.add('range-start', 'range-end');
+          } else if (hoverDate && hoverDate > S.checkIn) {
+            if (d > S.checkIn && d < hoverDate) cell.classList.add('in-range');
+            else if (d === hoverDate) cell.classList.add('range-end');
+          }
+        }
       });
     }
 
-    function onDateClick(e) {
-      const date = e.currentTarget.dataset.date;
+    function setupCalendarEvents() {
+      const grid = el('calendar-grid');
+
+      // Single click handler via delegation — survives innerHTML replacements
+      grid.addEventListener('click', e => {
+        const cell = e.target.closest('.cal-day.available');
+        if (!cell || !cell.dataset.date) return;
+        onDateClick(cell.dataset.date);
+      });
+
+      // Hover preview — only updates CSS classes, no DOM re-render
+      grid.addEventListener('mousemove', e => {
+        if (!S.checkIn || S.checkOut) return;
+        const cell = e.target.closest('.cal-day.available');
+        const newHover = (cell && cell.dataset.date) ? cell.dataset.date : null;
+        if (newHover !== hoverDate) {
+          hoverDate = newHover;
+          updateRangeDisplay();
+        }
+      });
+
+      grid.addEventListener('mouseleave', () => {
+        if (hoverDate !== null) {
+          hoverDate = null;
+          updateRangeDisplay();
+        }
+      });
+    }
+
+    function onDateClick(date) {
 
       if (!S.checkIn) {
         S.checkIn = date;
+        hoverDate = null;
       } else if (!S.checkOut) {
         if (date <= S.checkIn) {
+          // Clicked same or earlier date — reset check-in
           S.checkIn = date;
+          hoverDate = null;
         } else {
-          // Check if any blocked date in the range
+          // Check if any blocked date is within the range
           let conflict = false;
-          let cur = S.checkIn;
+          let cur = addDays(S.checkIn, 1);
           while (cur < date) {
+            if (blockedSet.has(cur)) { conflict = true; break; }
             cur = addDays(cur, 1);
-            if (cur < date && blockedSet.has(cur)) { conflict = true; break; }
           }
           if (conflict) {
-            showToast('A blocked date is within your selected range.', 'error');
+            showToast('A blocked date is within your selected range. Choose different dates.', 'error');
             return;
           }
           S.checkOut = date;
@@ -722,17 +753,18 @@
           el('btn-next-1').disabled = false;
         }
       } else {
-        // Reset and start over
+        // Both already selected — reset and start over
         S.checkIn = date;
         S.checkOut = null;
         S.nights = 0;
         S.baseTotal = 0;
+        hoverDate = null;
         el('btn-next-1').disabled = true;
       }
 
       updateDateChips();
       updatePriceSummary();
-      renderCalendar();
+      updateRangeDisplay();
     }
 
     function calcBaseTotal() {
@@ -1177,6 +1209,16 @@
         };
 
         await setDoc(tempRef, bookingData);
+
+        // Write to public availability collection (no personal info — used by calendar)
+        await setDoc(doc(clientRef, 'availability', bookingId), {
+          bookingId,
+          unitId,
+          checkIn: S.checkIn,
+          checkOut: S.checkOut,
+          status: 'pending_review',
+          createdAt: serverTimestamp(),
+        });
 
         // Call send-receipt (Stage 4 function — silently skip if not deployed yet)
         try {
