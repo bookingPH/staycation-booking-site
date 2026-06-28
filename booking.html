@@ -391,8 +391,7 @@
     import {
       getFirestore, doc, collection,
       query, where, getDocs, getDoc,
-      addDoc, setDoc, updateDoc,
-      onSnapshot, serverTimestamp
+      onSnapshot,
     } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
     import { FIREBASE_CONFIG, CLIENT_ID } from './firebase-config.js';
 
@@ -405,9 +404,9 @@
     const unitId = params.get('id');
     if (!unitId) { location.href = 'index.html'; }
 
-    const CLOUDINARY_CLOUD = 'dwqweaowd';
-    const CLOUDINARY_PRESET = 'booking-screenshots';
-    const SEND_RECEIPT_URL = 'https://staycation-admin.netlify.app/.netlify/functions/send-receipt';
+    const CREATE_BOOKING_URL = 'https://staycation-admin.netlify.app/.netlify/functions/create-booking';
+    const GET_UPLOAD_SIG_URL = 'https://staycation-admin.netlify.app/.netlify/functions/get-upload-signature';
+    const SEND_RECEIPT_URL   = 'https://staycation-admin.netlify.app/.netlify/functions/send-receipt';
 
     // ── HELPERS ───────────────────────────────────────
     const php = n => '₱' + Number(n).toLocaleString();
@@ -492,7 +491,7 @@
       try {
         const [unitSnap, settingsSnap] = await Promise.all([
           getDoc(doc(clientRef, 'units', unitId)),
-          getDoc(doc(clientRef, 'settings', 'main')),
+          getDoc(doc(clientRef, 'settings', 'public')),
         ]);
 
         if (!unitSnap.exists() || unitSnap.data().status !== 'active') {
@@ -524,16 +523,16 @@
         const st = S.settings;
         el('gcash-name').textContent = st.gcashName || '—';
         el('gcash-number').textContent = st.gcashNumber || '—';
-        if (st.gcashQR) el('qr-gcash').innerHTML = `<img src="${st.gcashQR}" alt="GCash QR">`;
+        if (st.gcashQrUrl) el('qr-gcash').innerHTML = `<img src="${st.gcashQrUrl}" alt="GCash QR">`;
 
-        el('paymaya-name').textContent = st.paymayaName || '—';
-        el('paymaya-number').textContent = st.paymayaNumber || '—';
-        if (st.paymayaQR) el('qr-paymaya').innerHTML = `<img src="${st.paymayaQR}" alt="PayMaya QR">`;
+        el('paymaya-name').textContent = st.mayaName || '—';
+        el('paymaya-number').textContent = st.mayaNumber || '—';
+        if (st.mayaQrUrl) el('qr-paymaya').innerHTML = `<img src="${st.mayaQrUrl}" alt="PayMaya QR">`;
 
         el('bank-name').textContent = st.bankName || '—';
         el('bank-acct-name').textContent = st.bankAccountName || '—';
-        el('bank-acct-number').textContent = st.bankAccountNumber || '—';
-        if (st.bankQR) el('qr-bank').innerHTML = `<img src="${st.bankQR}" alt="Bank QR">`;
+        el('bank-acct-number').textContent = st.bankAccount || '—';
+        if (st.bankQrUrl) el('qr-bank').innerHTML = `<img src="${st.bankQrUrl}" alt="Bank QR">`;
 
         const depositAmt = st.downPaymentAmount || 500;
         el('deposit-amount').textContent = php(depositAmt);
@@ -1125,32 +1124,47 @@
       el('btn-confirm').disabled = false;
     }
 
-    // ── CLOUDINARY UPLOAD ─────────────────────────────
-    function uploadToCloudinary(file, bookingId) {
+    // ── CLOUDINARY SIGNED UPLOAD ──────────────────────
+    async function uploadToCloudinarySigned(file) {
+      // Step 1: get signed params from our server (server controls folder, formats, size)
+      const sigRes = await fetch(GET_UPLOAD_SIG_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ clientId: CLIENT_ID }),
+      });
+      if (!sigRes.ok) {
+        const err = await sigRes.json().catch(() => ({}));
+        throw new Error(err.error || 'Failed to get upload signature');
+      }
+      const { signature, apiKey, timestamp, folder, cloudName } = await sigRes.json();
+
+      // Step 2: upload directly to Cloudinary using signed params
       return new Promise((resolve, reject) => {
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('upload_preset', CLOUDINARY_PRESET);
-        formData.append('folder', `payment-screenshots/${CLIENT_ID}/${bookingId}`);
+        formData.append('signature', signature);
+        formData.append('api_key', apiKey);
+        formData.append('timestamp', String(timestamp));
+        formData.append('folder', folder);
+        formData.append('allowed_formats', 'jpg,jpeg,png,webp');
+        formData.append('unique_filename', 'true');
+        formData.append('overwrite', 'false');
 
         const xhr = new XMLHttpRequest();
-        xhr.open('POST', `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/image/upload`);
+        xhr.open('POST', `https://api.cloudinary.com/v1_1/${cloudName}/image/upload`);
 
         const bar = el('upload-progress-bar');
         const fill = el('upload-progress-fill');
         bar.style.display = 'block';
 
         xhr.upload.onprogress = e => {
-          if (e.lengthComputable) {
-            fill.style.width = Math.round((e.loaded / e.total) * 90) + '%';
-          }
+          if (e.lengthComputable) fill.style.width = Math.round((e.loaded / e.total) * 90) + '%';
         };
 
         xhr.onload = () => {
           fill.style.width = '100%';
           if (xhr.status === 200) {
-            const data = JSON.parse(xhr.responseText);
-            resolve(data.secure_url);
+            resolve(JSON.parse(xhr.responseText).secure_url);
           } else {
             reject(new Error('Cloudinary upload failed: ' + xhr.status));
           }
@@ -1176,18 +1190,38 @@
       el('conflict-error').classList.remove('show');
 
       try {
-        // Final availability check — uses public availability collection (not admin-only bookings)
-        const conflictCheck = await getDocs(
-          query(
-            collection(clientRef, 'availability'),
-            where('unitId', '==', unitId),
-            where('status', 'in', ['pending_review', 'confirmed'])
-          )
-        );
+        // Stop calendar listener before any writes — prevents onSnapshot from clearing
+        // S.checkIn/S.checkOut when the new availability doc fires the listener
+        if (unsubCalendar) { unsubCalendar(); unsubCalendar = null; }
 
-        for (const d of conflictCheck.docs) {
-          const b = d.data();
-          if (b.checkIn < S.checkOut && b.checkOut > S.checkIn) {
+        // Upload payment screenshot (signed upload — server controls folder & restrictions)
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading screenshot...';
+        const screenshotUrl = await uploadToCloudinarySigned(S.screenshotFile);
+
+        // Create booking server-side (atomic inventory claim + server-side price calculation)
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving booking...';
+        const createRes = await fetch(CREATE_BOOKING_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            clientId: CLIENT_ID,
+            unitId,
+            checkIn: S.checkIn,
+            checkOut: S.checkOut,
+            guestName: S.guestName,
+            guestEmail: S.guestEmail,
+            guestPhone: S.guestPhone,
+            numGuests: S.numGuests,
+            addonIds: Object.keys(S.selectedAddons),
+            paymentMethod: S.paymentMethod,
+            screenshotUrl,
+          }),
+        });
+
+        const createData = await createRes.json();
+
+        if (!createRes.ok) {
+          if (createData.error === 'DATES_NOT_AVAILABLE') {
             el('conflict-error').classList.add('show');
             el('conflict-error').scrollIntoView({ behavior: 'smooth' });
             S.submitting = false;
@@ -1195,99 +1229,26 @@
             btn.innerHTML = '<i class="fa-solid fa-check"></i> Confirm Booking';
             return;
           }
+          throw new Error(createData.error || 'Booking failed — please try again');
         }
 
-        // Stop calendar listener NOW — before writing to Firestore.
-        // Otherwise the new availability entry triggers onSnapshot → rebuildBlocked
-        // which sees the user's own check-in as blocked and clears S.checkIn/S.checkOut.
-        if (unsubCalendar) { unsubCalendar(); unsubCalendar = null; }
+        const { bookingId, referenceNo, pricing } = createData;
 
-        // Create Firestore doc to get ID first
-        const bookingsCol = collection(clientRef, 'bookings');
-        const tempRef = doc(bookingsCol);
-        const bookingId = tempRef.id;
-        const referenceNo = 'BK-' + bookingId;
+        // Send receipt email — fire-and-forget, non-blocking
+        fetch(SEND_RECEIPT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ clientId: CLIENT_ID, bookingId }),
+        }).catch(e => console.log('send-receipt error (non-fatal):', e.message));
 
-        // Upload screenshot
-        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Uploading screenshot...';
-        const screenshotURL = await uploadToCloudinary(S.screenshotFile, bookingId);
-
-        // Save booking
-        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Saving booking...';
-        const reservationFee = S.settings?.downPaymentAmount || 500;
-        const securityDeposit = S.settings?.securityDeposit || 0;
-        const bookingData = {
-          bookingId,
-          referenceNo,
-          unitId,
-          unitName: S.unit.name,
-          guestName: S.guestName,
-          guestEmail: S.guestEmail,
-          guestPhone: S.guestPhone,
-          numGuests: S.numGuests,
-          checkIn: S.checkIn,
-          checkOut: S.checkOut,
-          nights: S.nights,
-          baseTotal: S.baseTotal,
-          extraGuests: S.extraGuests,
-          extraGuestTotal: S.extraGuestTotal,
-          addons: Object.values(S.selectedAddons),
-          addonsTotal: S.addonsTotal,
-          grandTotal: S.grandTotal,
-          reservationFee,
-          securityDeposit,
-          balanceDueAtCheckin: Math.max(0, S.grandTotal - reservationFee),
-          paymentMethod: S.paymentMethod,
-          screenshotURL,
-          status: 'pending_review',
-          createdAt: serverTimestamp(),
-        };
-
-        await setDoc(tempRef, bookingData);
-
-        // Write to public availability collection (no personal info — used by calendar)
-        await setDoc(doc(clientRef, 'availability', bookingId), {
-          bookingId,
-          unitId,
-          checkIn: S.checkIn,
-          checkOut: S.checkOut,
-          status: 'pending_review',
-          createdAt: serverTimestamp(),
-        });
-
-        // Call send-receipt (Stage 4 function — silently skip if not deployed yet)
-        try {
-          await fetch(SEND_RECEIPT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              clientId: CLIENT_ID,
-              bookingId,
-              referenceNo,
-              guestName: S.guestName,
-              guestEmail: S.guestEmail,
-              unitName: S.unit.name,
-              checkIn: S.checkIn,
-              checkOut: S.checkOut,
-              nights: S.nights,
-              grandTotal: S.grandTotal,
-              paymentMethod: S.paymentMethod,
-              screenshotURL,
-              adminPanelUrl: 'https://staycation-admin.netlify.app',
-            })
-          });
-        } catch (e) {
-          console.log('send-receipt not yet deployed, skipping:', e.message);
-        }
-
-        // Show confirmation
+        // Show confirmation screen using server-returned pricing
         el('conf-ref').textContent = referenceNo;
         el('conf-unit').textContent = S.unit.name;
         el('conf-name').textContent = S.guestName;
         el('conf-checkin').textContent = formatDisplayDate(S.checkIn);
         el('conf-checkout').textContent = formatDisplayDate(S.checkOut);
         el('conf-nights').textContent = `${S.nights} night${S.nights !== 1 ? 's' : ''}`;
-        el('conf-total').textContent = php(S.grandTotal);
+        el('conf-total').textContent = php(pricing?.grandTotal ?? S.grandTotal);
         el('conf-method').textContent = { gcash: 'GCash', paymaya: 'PayMaya', bank: 'Bank Transfer' }[S.paymentMethod] || S.paymentMethod;
         el('conf-email').textContent = S.guestEmail;
 
@@ -1295,7 +1256,7 @@
 
       } catch (e) {
         console.error('Submit error:', e);
-        showToast('Something went wrong. Please try again.', 'error', 6000);
+        showToast(e.message || 'Something went wrong. Please try again.', 'error', 6000);
         S.submitting = false;
         btn.disabled = false;
         btn.innerHTML = '<i class="fa-solid fa-check"></i> Confirm Booking';
