@@ -404,9 +404,9 @@
     const unitId = params.get('id');
     if (!unitId) { location.href = 'index.html'; }
 
-    const CREATE_BOOKING_URL = 'https://staycation-admin.netlify.app/.netlify/functions/create-booking';
-    const GET_UPLOAD_SIG_URL = 'https://staycation-admin.netlify.app/.netlify/functions/get-upload-signature';
-    const SEND_RECEIPT_URL   = 'https://staycation-admin.netlify.app/.netlify/functions/send-receipt';
+    const CREATE_BOOKING_URL = 'https://staycation-admin-ph.netlify.app/.netlify/functions/create-booking';
+    const GET_UPLOAD_SIG_URL = 'https://staycation-admin-ph.netlify.app/.netlify/functions/get-upload-signature';
+    const SEND_RECEIPT_URL   = 'https://staycation-admin-ph.netlify.app/.netlify/functions/send-receipt';
 
     // ── HELPERS ───────────────────────────────────────
     const php = n => '₱' + Number(n).toLocaleString();
